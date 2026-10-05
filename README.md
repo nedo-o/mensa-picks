@@ -11,7 +11,9 @@ Browser bedient. Dein Geschmacksprofil bleibt auf deinem Gerät.
 
 1. [Node.js](https://nodejs.org) installieren (LTS-Version, mindestens 20).
 2. Die App herunterladen: oben auf dieser GitHub-Seite **Code → Download ZIP**
-   und das ZIP entpacken. Oder mit Git: `git clone <Adresse dieses Repos>`.
+   und das ZIP entpacken
+   ([Direktlink](https://github.com/nedo-o/mensa-picks/archive/refs/heads/main.zip)).
+   Oder mit Git: `git clone https://github.com/nedo-o/mensa-picks.git`.
 
 Weitere Pakete oder ein `npm install` braucht es nicht.
 
