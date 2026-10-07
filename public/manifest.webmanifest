@@ -2,7 +2,7 @@
   "name": "Mensa-Picks",
   "short_name": "Mensa-Picks",
   "description": "Meine Top-3-Menüs aus allen ETH- und UZH-Mensen",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#f7f4ef",
   "theme_color": "#d9480f",

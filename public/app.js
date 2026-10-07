@@ -6,6 +6,7 @@ import {
 
 const app = document.getElementById('app');
 const dialog = document.getElementById('profile-dialog');
+const CONFIG = window.MENSA_CONFIG || {};
 
 const CAMPUSES = [
   ['alle', 'Alle'],
@@ -16,21 +17,22 @@ const CAMPUSES = [
 ];
 const CAMPUS_LABEL = Object.fromEntries(CAMPUSES);
 const MEALS = [['mittag', 'Mittag'], ['abend', 'Abend']];
-const SOURCES = ['eth', 'uzh'];
 const FIRST_ROUNDS = 15;
 const EXTRA_ROUNDS = 10;
 const MIN_ROUNDS = 8;
 
 const state = {
-  meta: null,
+  week: null, // { generatedAt, days, mensas, dishes }
+  today: zurichToday(),
   date: null,
   campus: readLocal('campus') || 'alle',
   profile: emptyProfile(),
-  menu: { eth: null, uzh: null },
-  loading: { eth: false, uzh: false },
-  errors: { eth: null, uzh: null },
+  profileId: null,
+  profileStatus: 'local', // 'local' (only this browser) | 'synced' | 'error'
+  loading: true,
+  error: null,
   view: 'main', // 'main' | 'nogo' | 'duel'
-  duel: null, // { pool, pair, round, total, used:Set, loading, first }
+  duel: null, // { pair, round, total, used:Set, first }
 };
 
 // ---------- helpers ----------
@@ -39,29 +41,27 @@ function readLocal(key) {
   try { return localStorage.getItem(`mensa.${key}`); } catch { return null; }
 }
 function writeLocal(key, value) {
-  try { localStorage.setItem(`mensa.${key}`, value); } catch { /* private mode */ }
+  try {
+    if (value == null) localStorage.removeItem(`mensa.${key}`);
+    else localStorage.setItem(`mensa.${key}`, value);
+  } catch { /* private mode */ }
 }
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const chf = (n) => (n == null ? null : Number(n).toFixed(2));
 
-async function api(path, options) {
-  const res = await fetch(path, options);
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `Fehler ${res.status}`);
-  return body;
+function zurichToday() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Zurich', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 }
 
-let saveTimer = null;
-function saveProfile() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    api('/api/profile', {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(state.profile),
-    }).catch((err) => toast(`Profil konnte nicht gespeichert werden: ${err.message}`));
-  }, 300);
+function dayLabel(ymd) {
+  const d = new Date(`${ymd}T12:00:00`);
+  return { wd: ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'][d.getDay()], dm: `${d.getDate()}.${d.getMonth() + 1}.` };
+}
+
+function timeLabel(iso) {
+  const d = new Date(iso);
+  return `${d.getDate()}.${d.getMonth() + 1}., ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
 function toast(message) {
@@ -72,107 +72,102 @@ function toast(message) {
   setTimeout(() => el.remove(), 4000);
 }
 
-function dayLabel(ymd) {
-  const d = new Date(`${ymd}T12:00:00`);
-  const wd = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'][d.getDay()];
-  return { wd, dm: `${d.getDate()}.${d.getMonth() + 1}.` };
+// ---------- profile storage ----------
+// The profile lives under a random code. With a profile API (the website) the
+// code is all you need to get the same taste on another device; without one
+// (local mode without server) it stays in this browser.
+
+const profileUrl = (id) => `${CONFIG.profileApi || ''}/p/${id}`;
+const hasApi = () => Boolean(CONFIG.profileApi) || CONFIG.site === 'local';
+
+function newProfileId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (b) => (b % 36).toString(36)).join('') + Date.now().toString(36).slice(-4);
+}
+
+function profileLink() {
+  return `${location.origin}${location.pathname}#p=${state.profileId}`;
+}
+
+async function loadProfile() {
+  // A link with #p=<code> switches this browser to that profile.
+  const fromLink = /[#&]p=([a-z0-9]{20,40})/.exec(location.hash)?.[1];
+  if (fromLink) {
+    writeLocal('profileId', fromLink);
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+  state.profileId = readLocal('profileId') || newProfileId();
+  writeLocal('profileId', state.profileId);
+
+  const backup = readLocal('profile');
+  if (hasApi()) {
+    try {
+      const res = await fetch(profileUrl(state.profileId), { cache: 'no-store' });
+      if (res.ok) {
+        state.profile = normalizeProfile(await res.json());
+        state.profileStatus = 'synced';
+        writeLocal('profile', JSON.stringify(state.profile));
+        return;
+      }
+      if (res.status !== 404) throw new Error(`Fehler ${res.status}`);
+      state.profileStatus = 'synced';
+    } catch (err) {
+      state.profileStatus = 'error';
+      toast(`Profil konnte nicht vom Server geladen werden: ${err.message}`);
+    }
+  }
+  if (backup && !fromLink) {
+    try { state.profile = normalizeProfile(JSON.parse(backup)); } catch { /* ignore */ }
+  }
+}
+
+let saveTimer = null;
+function saveProfile() {
+  writeLocal('profile', JSON.stringify(state.profile));
+  if (!hasApi()) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    try {
+      const res = await fetch(profileUrl(state.profileId), {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(state.profile),
+      });
+      if (!res.ok) throw new Error(`Fehler ${res.status}`);
+      state.profileStatus = 'synced';
+    } catch (err) {
+      state.profileStatus = 'error';
+      toast(`Profil konnte nicht gespeichert werden: ${err.message}`);
+    }
+  }, 400);
 }
 
 // ---------- data ----------
 
-async function loadMenu({ force = false } = {}) {
-  const date = state.date;
-  await Promise.all(SOURCES.map(async (src) => {
-    state.loading[src] = true;
-    state.errors[src] = null;
-    if (!force) state.menu[src] = null;
+async function loadWeek() {
+  state.loading = true;
+  state.error = null;
+  renderIfMain();
+  try {
+    const res = await fetch(`data/week.json?t=${Date.now()}`, { cache: 'no-store' });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `Fehler ${res.status}`);
+    state.week = body;
+    state.today = zurichToday();
+    if (!state.date || !body.days.includes(state.date)) state.date = body.days.includes(state.today) ? state.today : body.days[0];
+  } catch (err) {
+    state.error = err.message;
+  } finally {
+    state.loading = false;
     renderIfMain();
-    try {
-      const data = await api(`/api/menu?src=${src}&date=${date}${force ? '&refresh=1' : ''}`);
-      if (state.date !== date) return;
-      state.menu[src] = data;
-    } catch (err) {
-      if (state.date !== date) return;
-      state.errors[src] = err.message;
-    } finally {
-      if (state.date === date) {
-        state.loading[src] = false;
-        renderIfMain();
-      }
-    }
-  }));
+  }
 }
 
-const allDishes = () => SOURCES.flatMap((s) => state.menu[s]?.dishes || []);
-const allMensas = () => SOURCES.flatMap((s) => state.menu[s]?.mensas || []);
+const allDishes = () => state.week?.dishes || [];
 const inCampus = (x) => state.campus === 'alle' || x.campus === state.campus;
 
-// ---------- images ----------
+// ---------- rendering ----------
 
-const imageCache = new Map(); // dish id -> { url, source, credit, link } | 'none' | Promise
-
-function loadImage(id) {
-  if (!imageCache.has(id)) {
-    imageCache.set(id, (async () => {
-      try {
-        const res = await fetch(`/api/img/${encodeURIComponent(id)}`);
-        if (!res.ok) throw new Error('kein Bild');
-        const info = {
-          url: URL.createObjectURL(await res.blob()),
-          source: res.headers.get('x-img-source'),
-          credit: decodeURIComponent(res.headers.get('x-img-credit') || ''),
-          link: decodeURIComponent(res.headers.get('x-img-link') || ''),
-        };
-        imageCache.set(id, info);
-        return info;
-      } catch {
-        imageCache.set(id, 'none');
-        return 'none';
-      }
-    })());
-  }
-  return imageCache.get(id);
-}
-
-function showImage(el, info) {
-  el.classList.remove('loading');
-  if (info === 'none') {
-    el.classList.add('empty');
-    return;
-  }
-  const badge = info.source === 'web'
-    ? `<a class="symbol" ${info.link ? `href="${esc(info.link)}" target="_blank" rel="noopener"` : ''} title="${esc(info.credit || 'Bild aus dem Internet')}" data-stop>Symbolbild</a>`
-    : '';
-  el.insertAdjacentHTML('afterbegin', `<img src="${info.url}" alt="">${badge}`);
-}
-
-const imageObserver = new IntersectionObserver((entries) => {
-  for (const entry of entries) {
-    if (!entry.isIntersecting) continue;
-    imageObserver.unobserve(entry.target);
-    const el = entry.target;
-    Promise.resolve(loadImage(el.dataset.img)).then((info) => el.isConnected && showImage(el, info));
-  }
-}, { rootMargin: '300px' });
-
-function hydrateImages(root = document) {
-  for (const el of root.querySelectorAll('[data-img]:not([data-ready])')) {
-    el.dataset.ready = '1';
-    const known = imageCache.get(el.dataset.img);
-    if (known && !(known instanceof Promise)) showImage(el, known);
-    else imageObserver.observe(el);
-  }
-}
-
-const photo = (dish, extra = '') => `<div class="photo loading" data-img="${esc(dish.id)}"><span class="fallback" aria-hidden="true">${dietEmoji(dish)}</span>${extra}</div>`;
-
-function dietEmoji(dish) {
-  return { vegan: '🌱', vegi: '🥕', fisch: '🐟', fleisch: '🍖' }[dish.diet] || '🍽️';
-}
-
-// ---------- rendering: main ----------
-
-// Menu loads finishing in the background must not redraw the calibration screens.
 function renderIfMain() {
   if (state.view === 'main') render();
 }
@@ -181,24 +176,38 @@ function render() {
   if (state.view === 'nogo') app.innerHTML = renderNogoStep();
   else if (state.view === 'duel') app.innerHTML = renderDuel();
   else app.innerHTML = renderMain();
-  hydrateImages(app);
+}
+
+function photo(dish, extra = '') {
+  if (!dish.image) return `<div class="photo empty"><span class="fallback" aria-hidden="true">${dietEmoji(dish)}</span>${extra}</div>`;
+  const badge = dish.imageSource === 'web'
+    ? `<a class="symbol" ${dish.imageLink ? `href="${esc(dish.imageLink)}" target="_blank" rel="noopener"` : ''} title="${esc(dish.imageCredit || 'Bild aus dem Internet')}" data-stop>Symbolbild</a>`
+    : '';
+  return `<div class="photo"><span class="fallback" aria-hidden="true">${dietEmoji(dish)}</span>
+    <img src="${esc(dish.image)}" alt="" loading="lazy" onerror="this.parentNode.classList.add('empty'); this.remove()">${badge}${extra}</div>`;
+}
+
+function dietEmoji(dish) {
+  return { vegan: '🌱', vegi: '🥕', fisch: '🐟', fleisch: '🍖' }[dish.diet] || '🍽️';
 }
 
 function renderMain() {
-  const { meta } = state;
-  const days = meta.days.map((d) => {
+  if (state.error && !state.week) {
+    return `<header class="top"><div><h1>Mensa-Picks</h1></div></header>
+      <p class="notice error">Die Menüs konnten nicht geladen werden: ${esc(state.error)}</p>`;
+  }
+  if (!state.week) return '<p class="boot">Lade Menüs …</p>';
+  const { week } = state;
+  const days = week.days.map((d) => {
     const { wd, dm } = dayLabel(d);
     return `<button class="chip day ${d === state.date ? 'on' : ''}" data-action="day" data-value="${d}">
-      <strong>${d === meta.today ? 'Heute' : wd}</strong><span>${dm}</span></button>`;
+      <strong>${d === state.today ? 'Heute' : wd}</strong><span>${dm}</span></button>`;
   }).join('');
   const campuses = CAMPUSES.map(([id, label]) =>
     `<button class="chip ${id === state.campus ? 'on' : ''}" data-action="campus" data-value="${id}">${label}</button>`).join('');
-
-  const dishes = allDishes().filter(inCampus);
-  const busy = SOURCES.some((s) => state.loading[s]);
-
-  const errors = SOURCES.filter((s) => state.errors[s]).map((s) =>
-    `<p class="notice error">${s.toUpperCase()}-Menüs konnten nicht geladen werden: ${esc(state.errors[s])}</p>`).join('');
+  const dishes = allDishes().filter((d) => d.date === state.date && inCampus(d));
+  const stand = `Menüs vom ${timeLabel(week.generatedAt)}`;
+  const sync = state.profileStatus === 'error' ? ' · <span class="warn">Profil nicht gespeichert</span>' : '';
 
   return `
     <header class="top">
@@ -207,33 +216,27 @@ function renderMain() {
         <p class="sub">Deine Top 3 aus allen ETH- und UZH-Mensen</p>
       </div>
       <div class="top-actions">
-        <button class="btn ghost" data-action="refresh" ${busy ? 'disabled' : ''} title="Menüs neu laden">${busy ? 'Lädt …' : 'Aktualisieren'}</button>
+        <button class="btn ghost" data-action="reload" ${state.loading ? 'disabled' : ''}>${state.loading ? 'Lädt …' : 'Neu laden'}</button>
         <button class="btn" data-action="profile">Mein Geschmack</button>
       </div>
     </header>
     <nav class="row days" aria-label="Tag">${days}</nav>
     <nav class="row" aria-label="Standort">${campuses}</nav>
-    ${errors}
-    ${MEALS.map(([id, label]) => renderMeal(id, label, dishes.filter((d) => d.meal === id), busy)).join('')}
-    ${renderMensas(dishes, busy)}
-    <footer class="foot">Daten: ETH Zürich (Cookpit) und UZH/ZFV (Food2050). Symbolbilder: TheMealDB &amp; Openverse.</footer>`;
+    ${state.error ? `<p class="notice error">Neu laden fehlgeschlagen: ${esc(state.error)}</p>` : ''}
+    ${week.warnings?.length ? `<p class="notice">Teilweise unvollständig: ${esc(week.warnings.join(' · '))}</p>` : ''}
+    ${MEALS.map(([id, label]) => renderMeal(id, label, dishes.filter((d) => d.meal === id))).join('')}
+    ${renderMensas(dishes)}
+    <footer class="foot">${stand}${sync}<br>Daten: ETH Zürich (Cookpit) und UZH/ZFV (Food2050). Symbolbilder: TheMealDB &amp; Openverse.</footer>`;
 }
 
-function renderMeal(id, label, dishes, busy) {
+function renderMeal(id, label, dishes) {
   const mains = dishes.filter((d) => !d.side);
   const picks = topPicks(dishes, state.profile, 3);
   const blocked = mains.length - mains.filter((d) => !nogoReason(d, state.profile)).length;
   let body;
-  if (picks.length) {
-    body = `<div class="cards">${picks.map((p, i) => renderCard(p, i)).join('')}</div>`;
-    if (busy) body += '<p class="hint">Weitere Mensen werden noch geladen …</p>';
-  } else if (busy) {
-    body = `<div class="cards">${'<div class="card skeleton"></div>'.repeat(3)}</div>`;
-  } else if (mains.length) {
-    body = `<p class="notice">Alle ${mains.length} Menüs enthalten eines deiner No-Gos.</p>`;
-  } else {
-    body = `<p class="notice">Kein ${label === 'Abend' ? 'Abendmenü' : 'Mittagsmenü'} an diesem Tag${state.campus === 'alle' ? '' : ` am Standort ${CAMPUS_LABEL[state.campus]}`}.</p>`;
-  }
+  if (picks.length) body = `<div class="cards">${picks.map((p, i) => renderCard(p, i)).join('')}</div>`;
+  else if (mains.length) body = `<p class="notice">Alle ${mains.length} Menüs enthalten eines deiner No-Gos.</p>`;
+  else body = `<p class="notice">Kein ${label === 'Abend' ? 'Abendmenü' : 'Mittagsmenü'} an diesem Tag${state.campus === 'alle' ? '' : ` am Standort ${CAMPUS_LABEL[state.campus]}`}.</p>`;
   const count = mains.length ? `<span class="count">Top ${picks.length} von ${mains.length} Menüs${blocked ? ` · ${blocked} No-Go` : ''}</span>` : '';
   return `<section class="meal"><div class="meal-head"><h2>${label}</h2>${count}</div>${body}</section>`;
 }
@@ -289,9 +292,9 @@ function renderCard({ dish, score: s, alsoAt }, index) {
   </article>`;
 }
 
-function renderMensas(dishes, busy) {
-  const mensas = allMensas().filter(inCampus);
-  if (!mensas.length) return busy ? '' : '<section class="mensas"><h2>Mensen</h2><p class="notice">Keine Mensen geladen.</p></section>';
+function renderMensas(dishes) {
+  const mensas = (state.week.mensas || []).filter(inCampus);
+  if (!mensas.length) return '';
   const byMensa = new Map();
   for (const d of dishes) byMensa.set(d.mensaId, [...(byMensa.get(d.mensaId) || []), d]);
   const sorted = [...mensas].sort((a, b) =>
@@ -323,7 +326,7 @@ function renderDishRow(dish) {
   </li>`;
 }
 
-// ---------- rendering: calibration ----------
+// ---------- calibration ----------
 
 function chip(kind, id, label, on) {
   return `<button class="chip pick ${on ? 'on' : ''}" data-action="nogo" data-kind="${kind}" data-value="${esc(id)}" aria-pressed="${on}">${esc(label)}</button>`;
@@ -361,7 +364,6 @@ function renderNogoStep() {
 
 function renderDuel() {
   const d = state.duel;
-  if (d.loading) return '<div class="wizard"><h1>Geschmackstest</h1><p class="lead">Lade echte Menüs dieser Woche …</p></div>';
   if (!d.pair) {
     return `<div class="wizard"><h1>Geschmackstest</h1>
       <p class="notice">${d.error ? esc(d.error) : 'Es sind keine weiteren passenden Menüs zum Vergleichen da.'}</p>
@@ -392,24 +394,20 @@ function renderDuel() {
   </div>`;
 }
 
-async function startDuels(first) {
+function startDuels(first) {
   state.view = 'duel';
-  state.duel = { pool: [], pair: null, round: 1, total: first ? FIRST_ROUNDS : EXTRA_ROUNDS, used: new Set(), loading: true, first };
-  render();
-  const results = await Promise.allSettled(SOURCES.map((s) => api(`/api/pool?src=${s}`)));
-  const duel = state.duel;
-  if (!duel) return;
-  duel.pool = results.flatMap((r) => (r.status === 'fulfilled' ? r.value.dishes : []));
-  duel.loading = false;
-  if (!duel.pool.length) duel.error = 'Die Menüs konnten gerade nicht geladen werden. Versuch es später unter «Mein Geschmack» noch einmal.';
+  state.duel = { pair: null, round: 1, total: first ? FIRST_ROUNDS : EXTRA_ROUNDS, used: new Set(), first };
+  if (!allDishes().length) state.duel.error = 'Die Menüs sind gerade nicht geladen. Versuch es später unter «Mein Geschmack» noch einmal.';
   nextDuel();
 }
 
 function nextDuel() {
   const d = state.duel;
-  d.pair = d.round > d.total ? null : pickDuel(d.pool, state.profile, d.used);
+  // Dishes with a picture make a better test; the pool is this whole week.
+  const pool = allDishes().filter((x) => !x.side).sort((a, b) => Boolean(b.image) - Boolean(a.image));
+  d.pair = d.round > d.total ? null : pickDuel(pool, state.profile, d.used);
   if (d.round > d.total || !d.pair) {
-    if (d.pool.length && d.round > 1) return finishDuels();
+    if (pool.length && d.round > 1) return finishDuels();
   } else {
     for (const dish of d.pair) d.used.add(normName(dish.name));
   }
@@ -434,6 +432,12 @@ function renderProfile() {
   const bars = (list, cls) => (list.length
     ? list.map((e) => `<li><span>${esc(e.label)}</span><i class="${cls}" style="width:${Math.round((Math.abs(e.w) / max) * 100)}%"></i></li>`).join('')
     : '<li class="muted">Noch nichts gelernt</li>');
+  const linkSection = CONFIG.profileApi
+    ? `<section><h3>Profil-Link</h3>
+        <p class="hint">Öffne diesen Link auf dem Handy oder einem anderen Computer, dann hast du dort denselben Geschmack. Behandle ihn wie ein Passwort – wer ihn hat, kann dein Profil ändern.</p>
+        <div class="linkbox"><input type="text" readonly value="${esc(profileLink())}" data-input="link"><button class="btn" type="button" data-action="copy-link">Kopieren</button></div>
+      </section>`
+    : `<section><h3>Speicherort</h3><p class="hint">Dein Profil ist nur in diesem Browser gespeichert.</p></section>`;
   dialog.innerHTML = `
     <form method="dialog" class="sheet">
       <header><h2>Mein Geschmack</h2><button class="btn ghost" value="close">Schliessen</button></header>
@@ -449,6 +453,7 @@ function renderProfile() {
         </div>
       </section>
       <section><h3>No-Gos</h3>${nogoEditor()}</section>
+      ${linkSection}
     </form>`;
 }
 
@@ -470,15 +475,15 @@ function toggle(list, value) {
 const actions = {
   day(el) {
     state.date = el.dataset.value;
-    loadMenu();
+    render();
   },
   campus(el) {
     state.campus = el.dataset.value;
     writeLocal('campus', state.campus);
     render();
   },
-  refresh() {
-    loadMenu({ force: true });
+  reload() {
+    loadWeek();
   },
   profile: openProfile,
   vote(el) {
@@ -525,6 +530,15 @@ const actions = {
     nextDuel();
   },
   'finish-duels': finishDuels,
+  async 'copy-link'() {
+    try {
+      await navigator.clipboard.writeText(profileLink());
+      toast('Profil-Link kopiert');
+    } catch {
+      dialog.querySelector('[data-input="link"]')?.select();
+      toast('Bitte den Link markieren und kopieren');
+    }
+  },
   reset() {
     if (!confirm('Gelernten Geschmack und Daumen wirklich löschen? Deine No-Gos bleiben erhalten.')) return;
     const { nogo } = state.profile;
@@ -558,18 +572,9 @@ document.addEventListener('input', (event) => {
 // ---------- start ----------
 
 async function start() {
-  try {
-    const [meta, profile] = await Promise.all([api('/api/meta'), api('/api/profile')]);
-    state.meta = meta;
-    state.date = meta.defaultDay;
-    state.profile = normalizeProfile(profile);
-  } catch (err) {
-    app.innerHTML = `<p class="notice error">Der Server antwortet nicht: ${esc(err.message)}</p>`;
-    return;
-  }
+  await Promise.all([loadProfile(), loadWeek()]);
   if (!state.profile.calibrated) state.view = 'nogo';
   render();
-  loadMenu();
 }
 
 start();

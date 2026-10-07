@@ -1,0 +1,69 @@
+name: Website bauen und veröffentlichen
+
+on:
+  schedule:
+    # UTC; Zürich ist UTC+1 (Winter) bzw. UTC+2 (Sommer). Mehrmals am Vormittag,
+    # weil die Mensen ihre Fotos oft erst am Morgen hochladen.
+    - cron: '30 3 * * 1-5'
+    - cron: '0 6 * * 1-5'
+    - cron: '0 8 * * 1-5'
+    - cron: '30 9 * * 1-5'
+    - cron: '0 13 * * 1-5'
+    - cron: '0 6 * * 6,0'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Zwischenspeicher (Menüs, Bilder, Bildsuche) vom letzten Lauf holen
+        uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: mensa-cache-${{ github.run_id }}
+          restore-keys: mensa-cache-
+      - run: npm ci
+      - name: Menüs laden und Website bauen
+        run: node build/site.mjs
+        env:
+          PROFILE_API: ${{ vars.PROFILE_API }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - name: Repo aktiv halten (GitHub schaltet Zeitpläne nach 60 Tagen ohne Commits ab)
+        if: github.event_name == 'schedule'
+        run: |
+          date -u +%G-W%V > .last-build
+          if ! git diff --quiet -- .last-build; then
+            git config user.name github-actions
+            git config user.email github-actions@github.com
+            git add .last-build
+            git commit -m "Website gebaut in Woche $(cat .last-build) [skip ci]"
+            git push
+          fi
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,16 +1,19 @@
+// Local server: the same app and data as the website, built on this computer.
+// Profiles are stored in data/profiles/, pictures are fetched on demand.
+
 import http from 'node:http';
 import os from 'node:os';
-import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
-import { ROOT, DATA_DIR, readJsonFile, writeJsonFile, zurichNow, addDays, weekday, mondayOf, isYmd } from './lib/util.js';
-import { ethDay, ethWeek } from './lib/eth.js';
-import { uzhDay, uzhWeek } from './lib/uzh.js';
+import { ROOT, DATA_DIR, readJsonFile, writeJsonFile } from './lib/util.js';
+import { buildWeek, publicDish } from './lib/week.js';
 import { imageFor } from './lib/images.js';
 
 const PORT = Number(process.env.PORT) || 3210;
 const PUBLIC_DIR = path.join(ROOT, 'public');
-const PROFILE_FILE = path.join(DATA_DIR, 'profile.json');
+const PROFILE_DIR = path.join(DATA_DIR, 'profiles');
+const WEEK_TTL = 30 * 60e3;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -22,29 +25,24 @@ const MIME = {
   '.png': 'image/png',
 };
 
-const SOURCES = {
-  eth: { day: ethDay, week: ethWeek },
-  uzh: { day: uzhDay, week: uzhWeek },
-};
-
-// Image requests only carry a dish id; the dish itself is remembered here.
-const dishIndex = new Map();
-function remember(dishes) {
-  for (const d of dishes) dishIndex.set(d.id, d);
-  return dishes;
-}
-
 function json(res, status, body) {
   res.writeHead(status, { 'content-type': MIME['.json'], 'cache-control': 'no-store' });
   res.end(JSON.stringify(body));
 }
 
-// The week shown in the app: the current one, or the next one on weekends.
-function shownWeek() {
-  const now = zurichNow();
-  const monday = weekday(now.date) > 5 ? addDays(mondayOf(now.date), 7) : mondayOf(now.date);
-  const days = Array.from({ length: 5 }, (_, i) => addDays(monday, i));
-  return { today: now.date, monday, days, defaultDay: days.includes(now.date) ? now.date : monday };
+// The week is built once and kept for a while; dishes are indexed for image requests.
+let weekCache = null;
+const dishIndex = new Map();
+async function week() {
+  if (!weekCache || Date.now() - weekCache.at > WEEK_TTL) {
+    const built = await buildWeek();
+    for (const d of built.dishes) dishIndex.set(d.id, d);
+    weekCache = {
+      at: Date.now(),
+      value: { ...built, dishes: built.dishes.map((d) => publicDish(d, d.side ? null : { url: `/api/img/${encodeURIComponent(d.id)}` })) },
+    };
+  }
+  return weekCache.value;
 }
 
 async function readBody(req, limit = 300e3) {
@@ -58,26 +56,19 @@ async function readBody(req, limit = 300e3) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-async function handleApi(req, res, url) {
+async function handle(req, res, url) {
   const route = url.pathname;
 
-  if (route === '/api/meta') return json(res, 200, shownWeek());
+  if (route === '/config.js') {
+    res.writeHead(200, { 'content-type': MIME['.js'], 'cache-control': 'no-store' });
+    return res.end(`window.MENSA_CONFIG = ${JSON.stringify({ profileApi: '', site: 'local' })};\n`);
+  }
 
-  if (route === '/api/menu' || route === '/api/pool') {
-    const source = SOURCES[url.searchParams.get('src')];
-    if (!source) return json(res, 400, { error: 'src muss eth oder uzh sein' });
-    const force = url.searchParams.get('refresh') === '1';
+  if (route === '/data/week.json') {
     try {
-      if (route === '/api/pool') {
-        const { dishes } = await source.week(shownWeek().monday, { force });
-        return json(res, 200, { dishes: remember(dishes) });
-      }
-      const date = url.searchParams.get('date');
-      if (!isYmd(date)) return json(res, 400, { error: 'date fehlt (YYYY-MM-DD)' });
-      const { mensas, dishes } = await source.day(date, { force });
-      return json(res, 200, { date, mensas, dishes: remember(dishes) });
+      return json(res, 200, await week());
     } catch (err) {
-      console.error(`[api] ${route} ${url.search}: ${err.message}`);
+      console.error(`[week] ${err.message}`);
       return json(res, 502, { error: err.message });
     }
   }
@@ -92,23 +83,22 @@ async function handleApi(req, res, url) {
       res.writeHead(404, { 'cache-control': dish ? 'max-age=600' : 'no-store' });
       return res.end();
     }
-    res.writeHead(200, {
-      'content-type': image.type,
-      'cache-control': 'max-age=3600',
-      'x-img-source': image.source,
-      'x-img-credit': encodeURIComponent(image.credit || ''),
-      'x-img-link': encodeURIComponent(image.link || ''),
-    });
+    res.writeHead(200, { 'content-type': image.type, 'cache-control': 'max-age=3600' });
     return res.end(image.bytes);
   }
 
-  if (route === '/api/profile') {
-    if (req.method === 'GET') return json(res, 200, (await readJsonFile(PROFILE_FILE)) || {});
+  const profile = /^\/p\/([a-z0-9]{20,40})$/.exec(route);
+  if (profile) {
+    const file = path.join(PROFILE_DIR, `${profile[1]}.json`);
+    if (req.method === 'GET') {
+      const stored = await readJsonFile(file);
+      return stored ? json(res, 200, stored) : json(res, 404, { error: 'kein Profil' });
+    }
     if (req.method === 'PUT') {
       try {
-        const profile = JSON.parse(await readBody(req));
-        if (!profile || typeof profile !== 'object' || Array.isArray(profile)) throw new Error('kein Objekt');
-        await writeJsonFile(PROFILE_FILE, profile);
+        const body = JSON.parse(await readBody(req));
+        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('kein Objekt');
+        await writeJsonFile(file, body);
         return json(res, 200, { ok: true });
       } catch (err) {
         return json(res, 400, { error: `Profil ungültig: ${err.message}` });
@@ -117,11 +107,7 @@ async function handleApi(req, res, url) {
     return json(res, 405, { error: 'Methode nicht erlaubt' });
   }
 
-  return json(res, 404, { error: 'unbekannt' });
-}
-
-async function handleStatic(res, url) {
-  const rel = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname.slice(1));
+  const rel = route === '/' ? 'index.html' : decodeURIComponent(route.slice(1));
   const file = path.join(PUBLIC_DIR, rel);
   if (!file.startsWith(PUBLIC_DIR + path.sep)) {
     res.writeHead(403);
@@ -140,20 +126,12 @@ async function handleStatic(res, url) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
-    if (url.pathname.startsWith('/api/')) await handleApi(req, res, url);
-    else await handleStatic(res, url);
+    await handle(req, res, url);
   } catch (err) {
     console.error(`[server] ${req.method} ${req.url}: ${err.stack || err}`);
     if (!res.headersSent) json(res, 500, { error: 'Interner Fehler' });
     else res.end();
   }
-});
-
-server.on('error', (err) => {
-  if (err.code !== 'EADDRINUSE') throw err;
-  console.error(`\n  Port ${PORT} ist schon belegt – Mensa-Picks läuft vermutlich bereits.`);
-  console.error(`  Öffne einfach http://localhost:${PORT} oder starte mit einem anderen Port: PORT=3211 node server.js\n`);
-  process.exit(1);
 });
 
 // `node server.js --open` (used by the start scripts) also opens the browser.
@@ -163,6 +141,13 @@ function openBrowser(url) {
     : ['xdg-open', [url]];
   spawn(cmd, args, { stdio: 'ignore', detached: true }).on('error', () => {}).unref();
 }
+
+server.on('error', (err) => {
+  if (err.code !== 'EADDRINUSE') throw err;
+  console.error(`\n  Port ${PORT} ist schon belegt – Mensa-Picks läuft vermutlich bereits.`);
+  console.error(`  Öffne einfach http://localhost:${PORT} oder starte mit einem anderen Port: PORT=3211 node server.js\n`);
+  process.exit(1);
+});
 
 server.listen(PORT, '0.0.0.0', () => {
   const lan = Object.values(os.networkInterfaces()).flat().filter((i) => i && i.family === 'IPv4' && !i.internal).map((i) => i.address);
