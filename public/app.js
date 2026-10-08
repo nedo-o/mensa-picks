@@ -18,7 +18,7 @@ const CAMPUSES = [
 const CAMPUS_LABEL = Object.fromEntries(CAMPUSES);
 const MEALS = [['mittag', 'Mittag'], ['abend', 'Abend']];
 const FIRST_ROUNDS = 15;
-const EXTRA_ROUNDS = 10;
+const EXTRA_ROUNDS = 30;
 const MIN_ROUNDS = 8;
 
 const state = {
