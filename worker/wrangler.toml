@@ -5,4 +5,4 @@ compatibility_date = "2026-01-01"
 # Die ID wird mit `npx wrangler kv namespace create PROFILES` erzeugt und hier eingetragen.
 [[kv_namespaces]]
 binding = "PROFILES"
-id = "KV_NAMESPACE_ID"
+id = "19217e70c58f42cf84e636769b3af0d8"
